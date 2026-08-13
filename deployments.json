@@ -1,0 +1,7 @@
+{
+  "monad_testnet": {
+    "chain_id": 10143,
+    "escrow_address": "0x0000000000000000000000000000000000000000",
+    "deployed_at_block": 0
+  }
+}

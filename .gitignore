@@ -1,0 +1,18 @@
+# Foundry build artifacts
+contracts/out/
+contracts/cache/
+
+# Go
+*.exe
+*.test
+*.prof
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

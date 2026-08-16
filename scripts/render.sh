@@ -4,8 +4,11 @@
 # and Leash Proxy & Dashboard on $PORT in foreground.
 set -euo pipefail
 
+# Render assigns $PORT dynamically (e.g. 10000)
 PORT="${PORT:-8085}"
+PORT="${PORT#:}" # strip leading colon if present
 MERCHANT_PORT="${MERCHANT_PORT:-8081}"
+MERCHANT_PORT="${MERCHANT_PORT#:}"
 
 echo "================================================="
 echo "  🚀 Starting Leash Rig on Monad Testnet"

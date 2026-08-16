@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: leash
+    runtime: go
+    buildCommand: go build -o bin/ ./cmd/...
+    startCommand: bash scripts/render.sh
+    envVars:
+      - key: MONAD_RPC
+        value: https://testnet-rpc.monad.xyz
+      - key: LEASH_ESCROW
+        value: 0x678d1Ef8835A51BCF215a9922c5775eF7D97C8A5
+      - key: LEASH_DEFAULT_TTL
+        value: "60"
+      - key: BUYER_KEY
+        sync: false

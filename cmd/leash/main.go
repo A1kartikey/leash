@@ -36,7 +36,14 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "dashboard + proxy listen address")
+	defaultAddr := ":8080"
+	if p := os.Getenv("PORT"); p != "" {
+		if !strings.HasPrefix(p, ":") {
+			p = ":" + p
+		}
+		defaultAddr = p
+	}
+	addr := flag.String("addr", defaultAddr, "dashboard + proxy listen address")
 	upstream := flag.String("upstream", "http://localhost:8081", "origin every non-dashboard request is forwarded to")
 	tenant := flag.String("tenant", "agent-1", "tenant id — scopes every ledger row and breaker counter")
 	dbPath := flag.String("db", filepath.Join(os.TempDir(), "leash.db"), "obligation ledger path")

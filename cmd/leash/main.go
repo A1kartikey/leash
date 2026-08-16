@@ -103,34 +103,25 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("HEAD /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("HEAD /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
 	})
 	mux.Handle("GET /events", http.HandlerFunc(d.events))
 	mux.Handle("GET /api/state", http.HandlerFunc(d.state))
 
 	ui := http.FileServer(http.Dir(*webDir))
-	handleUI := func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || strings.HasSuffix(r.URL.Path, ".html") ||
 			strings.HasSuffix(r.URL.Path, ".css") || strings.HasSuffix(r.URL.Path, ".js") {
 			ui.ServeHTTP(w, r)
 			return
 		}
 		d.proxy(w, r, *upstream)
-	}
-
-	mux.HandleFunc("GET /", handleUI)
-	mux.HandleFunc("HEAD /", handleUI)
-	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		d.proxy(w, r, *upstream)
-	}))
+	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
 	go func() {

@@ -5,7 +5,6 @@ package types
 import (
 	"context"
 	"math/big"
-	"net/http"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -65,12 +64,14 @@ type Obligation struct {
 	EscrowID        EscrowID
 	TenantID        TenantID
 	Merchant        common.Address
-	Amount          *big.Int   // wei — never float64, never int64
+	Amount          *big.Int // wei — never float64, never int64
+	ResourceID      string   // the merchant's label for what was bought
 	ResourceHash    [32]byte
 	LockedAt        time.Time
 	ReleaseDeadline time.Time
 	DeliveredAt     *time.Time // nil until delivery is confirmed
 	Status          Status
+	LockTx          TxHash // the tx that created the escrow
 	SettleTx        TxHash
 }
 
@@ -159,6 +160,10 @@ type Ledger interface {
 // described by the Challenge. Deterministic only — no LLM, no probabilistic
 // scoring.
 type Verifier interface {
-	// Verify inspects the response against the challenge parameters.
-	Verify(ctx context.Context, c Challenge, resp *http.Response) (Verdict, error)
+	// Verify inspects an already-read response against the challenge
+	// parameters. The caller does all the I/O: it reads and closes the body
+	// and passes the status and Content-Type in as plain values, so the
+	// response stays readable downstream. A transport failure (timeout,
+	// context deadline) is passed as status 0 with a nil body.
+	Verify(ctx context.Context, c Challenge, status int, contentType string, body []byte) (Verdict, error)
 }

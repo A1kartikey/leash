@@ -24,6 +24,12 @@ import (
 // Strategy: poll-based filter. Monad testnet may not support eth_subscribe
 // over HTTP. We poll FilterEscrowLocked (and Released/Refunded/Partial)
 // every pollInterval from a cursor block.
+//
+// EscrowLocked and EscrowRefunded index the buyer, so the node filters those
+// for us. EscrowReleased indexes (id, merchant) — the buyer is not in its
+// topics, so no log filter can scope it and we must attribute it ourselves
+// from the escrow IDs we have seen locked. Only a buyer can release their own
+// escrow, so a release we cannot attribute is not ours to report.
 // ---------------------------------------------------------------------------
 
 const pollInterval = 2 * time.Second
@@ -44,6 +50,11 @@ func eventPoller(
 	cursor := startBlock
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+
+	// Escrow IDs this poller has seen locked by our buyer. It is the only way
+	// to tell our releases from a stranger's, and it stays bounded: an id is
+	// dropped the moment the escrow settles.
+	mine := make(map[uint64]bool)
 
 	for {
 		select {
@@ -67,6 +78,7 @@ func eventPoller(
 			if err == nil {
 				for lockedIter.Next() {
 					ev := lockedIter.Event
+					mine[ev.Id.Uint64()] = true
 					select {
 					case out <- types.EscrowEvent{
 						Kind:        types.EventLocked,
@@ -87,8 +99,13 @@ func eventPoller(
 			if err == nil {
 				for releasedIter.Next() {
 					ev := releasedIter.Event
-					// We can't filter Released by buyer (it's indexed by merchant),
-					// so we emit all and let the caller match by EscrowID.
+					// Indexed by merchant, so this iterator carries every
+					// release on the singleton. Ours are the ones we watched
+					// get locked; the rest belong to other buyers entirely.
+					if !mine[ev.Id.Uint64()] {
+						continue
+					}
+					delete(mine, ev.Id.Uint64())
 					select {
 					case out <- types.EscrowEvent{
 						Kind:        types.EventReleased,
@@ -109,6 +126,7 @@ func eventPoller(
 			if err == nil {
 				for refundedIter.Next() {
 					ev := refundedIter.Event
+					delete(mine, ev.Id.Uint64())
 					select {
 					case out <- types.EscrowEvent{
 						Kind:        types.EventRefunded,
@@ -154,8 +172,10 @@ func reconcileFromBlock(
 	defer lockedIter.Close()
 
 	var maxBlock uint64
+	mine := make(map[uint64]bool)
 	for lockedIter.Next() {
 		ev := lockedIter.Event
+		mine[ev.Id.Uint64()] = true
 		events = append(events, types.EscrowEvent{
 			Kind:        types.EventLocked,
 			EscrowID:    types.EscrowID(ev.Id.Uint64()),
@@ -187,7 +207,10 @@ func reconcileFromBlock(
 		}
 	}
 
-	// Released events (not filterable by buyer — indexed by merchant).
+	// Released events are indexed by merchant, so this pass sees every buyer's
+	// releases. Ours are the ones whose locks the pass above just replayed —
+	// a release outside that set belongs to another buyer, and reporting it
+	// would put a stranger's escrow id into our recovery path.
 	releasedIter, err := contract.FilterEscrowReleased(opts, nil, nil)
 	if err != nil {
 		return events, maxBlock, fmt.Errorf("reconcile released: %w", err)
@@ -196,6 +219,9 @@ func reconcileFromBlock(
 
 	for releasedIter.Next() {
 		ev := releasedIter.Event
+		if !mine[ev.Id.Uint64()] {
+			continue
+		}
 		events = append(events, types.EscrowEvent{
 			Kind:        types.EventReleased,
 			EscrowID:    types.EscrowID(ev.Id.Uint64()),

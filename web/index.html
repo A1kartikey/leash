@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leash</title>
+<style>
+  :root {
+    --bg:      #0b0d10;
+    --panel:   #14171c;
+    --line:    #23272e;
+    --text:    #e8ecf1;
+    --dim:     #7d8794;
+    --green:   #35d07f;
+    --red:     #ff5b5b;
+    --amber:   #ffb84d;
+    --blue:    #6ea8ff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 var(--mono);
+    padding: 20px 24px 40px;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 22px;
+  }
+  header .brand { font-size: 20px; font-weight: 700; letter-spacing: .18em; }
+  header .meta { color: var(--dim); font-size: 12px; }
+  header .live { margin-left: auto; font-size: 12px; color: var(--dim); }
+  header .live b { color: var(--red); }
+  header .live.on b { color: var(--green); }
+
+  /* 1. The three balances — this is what a room reads from five metres away. */
+  .balances { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 22px; }
+  .bal {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px 16px;
+  }
+  .bal .label { font-size: 12px; letter-spacing: .22em; color: var(--dim); text-transform: uppercase; }
+  .bal .value { font-size: clamp(34px, 6vw, 64px); font-weight: 700; line-height: 1.05; margin-top: 6px; letter-spacing: -.02em; }
+  .bal .unit  { font-size: .4em; color: var(--dim); font-weight: 500; margin-left: .3em; }
+  .bal .sub   { font-size: 13px; color: var(--dim); margin-top: 4px; min-height: 18px; }
+  #v-locked .value    { color: var(--amber); }
+  #v-recovered .value { color: var(--green); }
+
+  .cols { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 900px) {
+    .balances { grid-template-columns: 1fr; }
+    .cols { grid-template-columns: 1fr; }
+  }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .panel h2 {
+    margin: 0; padding: 10px 14px; font-size: 11px; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line); font-weight: 600;
+  }
+
+  /* 2. Live event feed, newest on top. */
+  #feed { max-height: 62vh; overflow-y: auto; }
+  .row {
+    display: grid; grid-template-columns: 18px 62px 58px auto 1fr auto;
+    gap: 10px; align-items: baseline;
+    padding: 7px 14px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  .row:last-child { border-bottom: 0; }
+  .row .mark { font-size: 13px; }
+  .row .kind { color: var(--dim); }
+  .row .id   { color: var(--dim); }
+  .row .amt  { font-variant-numeric: tabular-nums; }
+  .row .res  { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+  .row .tx   { font-size: 12px; }
+  .row.lock     .mark { color: var(--blue); }
+  .row.released .mark, .row.released .amt { color: var(--green); }
+  .row.refunded .mark { color: var(--dim); }
+  .row.partial  .mark, .row.partial .amt { color: var(--amber); }
+  .empty { padding: 16px 14px; color: var(--dim); }
+
+  /* 3 + 4. Merchant balances and circuit state, side by side with the agent. */
+  .who { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 14px; border-bottom: 1px solid var(--line); gap: 12px; }
+  .who:last-child { border-bottom: 0; }
+  .who .name { font-size: 12px; color: var(--dim); letter-spacing: .1em; text-transform: uppercase; }
+  .who .addr { font-size: 11px; color: var(--dim); }
+  .who .num  { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+  .who .num .unit { font-size: .5em; color: var(--dim); font-weight: 500; margin-left: .3em; }
+  .circuit { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; letter-spacing: .14em; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .closed   .dot { background: var(--green); } .closed   { color: var(--green); }
+  .open     .dot { background: var(--red); }   .open     { color: var(--red); }
+  .halfopen .dot { background: var(--amber); } .halfopen { color: var(--amber); }
+
+  footer { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); display: flex; gap: 10px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="brand">LEASH</span>
+  <span class="meta">tenant <b id="tenant">—</b> · buyer <a id="buyer" href="#">—</a></span>
+  <span class="live" id="live">stream <b>offline</b></span>
+</header>
+
+<section class="balances">
+  <div class="bal" id="v-spendable">
+    <div class="label">Spendable</div>
+    <div class="value">0.0000<span class="unit">MON</span></div>
+    <div class="sub">on-chain balance</div>
+  </div>
+  <div class="bal" id="v-locked">
+    <div class="label">Locked</div>
+    <div class="value">0.0000<span class="unit">MON</span></div>
+    <div class="sub" id="pending">0 pending</div>
+  </div>
+  <div class="bal" id="v-recovered">
+    <div class="label">Recovered</div>
+    <div class="value">0.0000<span class="unit">MON</span></div>
+    <div class="sub">refunded by the sweeper</div>
+  </div>
+</section>
+
+<div class="cols">
+  <section class="panel">
+    <h2>Live ledger feed</h2>
+    <div id="feed"><div class="empty">waiting for the first lock…</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>Balances &amp; circuit</h2>
+    <div id="parties">
+      <div class="who">
+        <div><div class="name">Agent</div><div class="addr" id="agent-addr">—</div></div>
+        <div class="num" id="agent-bal">0.0000<span class="unit">MON</span></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <span>Contract <a id="contract" href="#">—</a></span>
+  <span>·</span>
+  <span>One contract. No owner.</span>
+</footer>
+
+<script>
+const WEI = 10n ** 18n;
+
+// Wei is a BigInt end to end. Never parse it as a Number: 0.05 MON is
+// 50000000000000000 wei and float64 loses the tail.
+function mon(wei, dp = 4) {
+  let v;
+  try { v = BigInt(wei || "0"); } catch { return "0.0000"; }
+  const neg = v < 0n;
+  if (neg) v = -v;
+  const whole = v / WEI;
+  const frac = (v % WEI).toString().padStart(18, "0").slice(0, dp);
+  return (neg ? "-" : "") + whole.toString() + "." + frac;
+}
+const short = a => a ? a.slice(0, 6) + "…" + a.slice(-4) : "—";
+const num = (el, wei) => { el.innerHTML = mon(wei) + '<span class="unit">MON</span>'; };
+
+const MARKS = { lock: "●", released: "✓", refunded: "↩", partial: "◐" };
+const LABEL = { lock: "lock", released: "release", refunded: "refund", partial: "partial" };
+
+let explorer = "";
+const feed = document.getElementById("feed");
+const seen = new Set();
+
+function rowKey(r) { return r.kind + ":" + r.escrow_id; }
+
+function render(r, prepend) {
+  const key = rowKey(r);
+  if (seen.has(key)) return;
+  seen.add(key);
+
+  const el = document.createElement("div");
+  el.className = "row " + r.kind;
+
+  // A partial shows what actually reached the merchant against what was locked.
+  const amount = r.kind === "partial"
+    ? mon(r.paid_amount) + "/" + mon(r.amount)
+    : mon(r.amount);
+
+  const tx = r.tx
+    ? `<a class="tx" href="${explorer}/tx/${r.tx}" target="_blank" rel="noopener">${short(r.tx)}</a>`
+    : `<span class="tx"></span>`;
+
+  el.innerHTML =
+    `<span class="mark">${MARKS[r.kind] || "·"}</span>` +
+    `<span class="kind">${LABEL[r.kind] || r.kind}</span>` +
+    `<span class="id">#${r.escrow_id}</span>` +
+    `<span class="amt">${amount} MON</span>` +
+    `<span class="res">${r.resource_id || short(r.merchant)}</span>` +
+    tx;
+
+  const empty = feed.querySelector(".empty");
+  if (empty) empty.remove();
+  if (prepend) feed.prepend(el); else feed.append(el);
+  while (feed.children.length > 200) feed.lastChild.remove();
+}
+
+function applyState(s) {
+  explorer = s.explorer || "";
+  document.getElementById("tenant").textContent = s.tenant;
+
+  const buyer = document.getElementById("buyer");
+  buyer.textContent = short(s.buyer);
+  buyer.href = `${explorer}/address/${s.buyer}`;
+
+  const contract = document.getElementById("contract");
+  contract.textContent = s.contract;
+  contract.href = `${explorer}/address/${s.contract}`;
+
+  num(document.querySelector("#v-spendable .value"), s.spendable);
+  num(document.querySelector("#v-locked .value"), s.locked);
+  num(document.querySelector("#v-recovered .value"), s.recovered);
+  document.getElementById("pending").textContent =
+    `${s.pending} pending`;
+
+  document.getElementById("agent-addr").textContent = short(s.buyer);
+  num(document.getElementById("agent-bal"), s.spendable);
+
+  // Merchants: balance next to the agent's, plus the circuit state. Revenue
+  // staying flat while Locked climbs is the whole story of "paid, not
+  // delivered" — no narration required.
+  const parties = document.getElementById("parties");
+  for (const el of [...parties.querySelectorAll(".merchant")]) el.remove();
+  for (const m of s.merchants || []) {
+    const cls = m.circuit === "half-open" ? "halfopen" : m.circuit;
+    const label = m.circuit === "closed" ? "CLOSED" : m.circuit === "open" ? "OPEN" : "HALF-OPEN";
+    const el = document.createElement("div");
+    el.className = "who merchant";
+    el.innerHTML =
+      `<div>
+         <div class="name">Merchant</div>
+         <div class="addr"><a href="${explorer}/address/${m.address}" target="_blank" rel="noopener">${short(m.address)}</a></div>
+         <div class="circuit ${cls}"><span class="dot"></span>${label}</div>
+       </div>
+       <div class="num">${mon(m.balance)}<span class="unit">MON</span></div>`;
+    parties.append(el);
+  }
+}
+
+// Seed from the ledger so a refresh does not start blank, then go live.
+fetch("/api/state")
+  .then(r => r.json())
+  .then(s => {
+    applyState(s);
+    for (const r of s.recent || []) render(r, false);
+  })
+  .catch(() => {});
+
+const live = document.getElementById("live");
+const es = new EventSource("/events");
+es.addEventListener("open", () => { live.className = "live on"; live.innerHTML = "stream <b>live</b>"; });
+es.addEventListener("error", () => { live.className = "live"; live.innerHTML = "stream <b>reconnecting</b>"; });
+es.addEventListener("state", e => applyState(JSON.parse(e.data)));
+es.addEventListener("ledger", e => render(JSON.parse(e.data), true));
+</script>
+</body>
+</html>

@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/A1kartikey/leash/internal/types"
@@ -35,11 +36,13 @@ CREATE TABLE IF NOT EXISTS obligations (
 	tenant_id        TEXT NOT NULL,
 	merchant         TEXT NOT NULL,
 	amount           TEXT NOT NULL,
+	resource_id      TEXT NOT NULL DEFAULT '',
 	resource_hash    BLOB NOT NULL,
 	locked_at        INTEGER NOT NULL,
 	release_deadline INTEGER NOT NULL,
 	delivered_at     INTEGER,
 	status           TEXT NOT NULL,
+	lock_tx          TEXT,
 	settle_tx        TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_pending ON obligations(status, release_deadline);
@@ -62,11 +65,30 @@ func New(path string) (*SQLiteLedger, error) {
 		return nil, fmt.Errorf("ledger: opening %s: %w", path, err)
 	}
 
-	// SQLite concurrency: WAL mode allows concurrent readers with a single
-	// writer, which matches our sidecar's access pattern.
+	// SQLite allows exactly one writer. database/sql opens a pool, so two
+	// tenants settling at the same instant become two writers and the second
+	// gets SQLITE_BUSY immediately — which is not a slow query but an escrow
+	// locked on-chain with no row recording it, the precise failure this
+	// ledger exists to prevent.
+	//
+	// One connection makes the pool serialise writers in-process; busy_timeout
+	// covers the case where another process holds the file. Writes here are
+	// single small rows, so serialising them costs nothing worth measuring.
+	//
+	// ponytail: a single connection also serialises reads; give readers their
+	// own pool if snapshot queries ever show up in a profile.
+	db.SetMaxOpenConns(1)
+
+	// WAL lets readers run while a writer holds the file, and unlike
+	// busy_timeout it is stored in the database itself rather than per
+	// connection.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ledger: enabling WAL: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ledger: setting busy timeout: %w", err)
 	}
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		db.Close()
@@ -76,6 +98,19 @@ func New(path string) (*SQLiteLedger, error) {
 	if _, err := db.ExecContext(context.Background(), schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ledger: applying schema: %w", err)
+	}
+
+	// Columns added after the first databases were written. ALTER is the whole
+	// migration story here: the error on an already-migrated database is the
+	// only signal we need.
+	for _, alter := range []string{
+		`ALTER TABLE obligations ADD COLUMN resource_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE obligations ADD COLUMN lock_tx TEXT`,
+	} {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("ledger: migrating: %w", err)
+		}
 	}
 
 	return &SQLiteLedger{db: db}, nil
@@ -99,15 +134,21 @@ func (l *SQLiteLedger) Close() error {
 func (l *SQLiteLedger) Open(ctx context.Context, tenant types.TenantID, ob types.Obligation) error {
 	const q = `
 		INSERT OR IGNORE INTO obligations
-			(escrow_id, tenant_id, merchant, amount, resource_hash,
-			 locked_at, release_deadline, delivered_at, status, settle_tx)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(escrow_id, tenant_id, merchant, amount, resource_id, resource_hash,
+			 locked_at, release_deadline, delivered_at, status, lock_tx, settle_tx)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var deliveredAt *int64
 	if ob.DeliveredAt != nil {
 		v := ob.DeliveredAt.Unix()
 		deliveredAt = &v
+	}
+
+	var lockTx *string
+	if ob.LockTx != "" {
+		s := string(ob.LockTx)
+		lockTx = &s
 	}
 
 	var settleTx *string
@@ -121,11 +162,13 @@ func (l *SQLiteLedger) Open(ctx context.Context, tenant types.TenantID, ob types
 		string(tenant),
 		ob.Merchant.Hex(),
 		ob.Amount.String(), // wei as decimal TEXT — never REAL, never INTEGER
+		ob.ResourceID,
 		ob.ResourceHash[:],
 		ob.LockedAt.Unix(),
 		ob.ReleaseDeadline.Unix(),
 		deliveredAt,
 		string(ob.Status),
+		lockTx,
 		settleTx,
 	)
 	if err != nil {
@@ -179,8 +222,8 @@ func (l *SQLiteLedger) MarkSettled(ctx context.Context, tenant types.TenantID, i
 // Scoped by tenant_id.
 func (l *SQLiteLedger) Pending(ctx context.Context, tenant types.TenantID) ([]types.Obligation, error) {
 	const q = `
-		SELECT escrow_id, tenant_id, merchant, amount, resource_hash,
-		       locked_at, release_deadline, delivered_at, status, settle_tx
+		SELECT escrow_id, tenant_id, merchant, amount, resource_id, resource_hash,
+		       locked_at, release_deadline, delivered_at, status, lock_tx, settle_tx
 		FROM obligations
 		WHERE tenant_id = ? AND status = 'locked' AND release_deadline <= ?
 		ORDER BY release_deadline ASC
@@ -194,6 +237,84 @@ func (l *SQLiteLedger) Pending(ctx context.Context, tenant types.TenantID) ([]ty
 	defer rows.Close()
 
 	return scanObligations(rows)
+}
+
+// Get returns one obligation. Scoped by tenant_id: an escrow that belongs to
+// another tenant reads as not found.
+func (l *SQLiteLedger) Get(ctx context.Context, tenant types.TenantID, id types.EscrowID) (types.Obligation, error) {
+	const q = `
+		SELECT escrow_id, tenant_id, merchant, amount, resource_id, resource_hash,
+		       locked_at, release_deadline, delivered_at, status, lock_tx, settle_tx
+		FROM obligations
+		WHERE tenant_id = ? AND escrow_id = ?
+	`
+
+	rows, err := l.db.QueryContext(ctx, q, string(tenant), int64(id))
+	if err != nil {
+		return types.Obligation{}, fmt.Errorf("ledger: get escrow %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	obs, err := scanObligations(rows)
+	if err != nil {
+		return types.Obligation{}, err
+	}
+	if len(obs) == 0 {
+		return types.Obligation{}, fmt.Errorf("ledger: escrow %d not found for tenant %s", id, tenant)
+	}
+	return obs[0], nil
+}
+
+// Recent returns the tenant's most recent obligations, newest first. It seeds
+// the dashboard feed on page load so a refresh does not start blank — the same
+// rows the live event stream then appends to.
+func (l *SQLiteLedger) Recent(ctx context.Context, tenant types.TenantID, limit int) ([]types.Obligation, error) {
+	const q = `
+		SELECT escrow_id, tenant_id, merchant, amount, resource_id, resource_hash,
+		       locked_at, release_deadline, delivered_at, status, lock_tx, settle_tx
+		FROM obligations
+		WHERE tenant_id = ?
+		ORDER BY locked_at DESC, escrow_id DESC
+		LIMIT ?
+	`
+
+	rows, err := l.db.QueryContext(ctx, q, string(tenant), limit)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: recent for %s: %w", tenant, err)
+	}
+	defer rows.Close()
+
+	return scanObligations(rows)
+}
+
+// Merchants lists every merchant this tenant has locked funds to, newest
+// first. It is what the dashboard iterates for balances and circuit state —
+// the ledger is the only record of who we have paid.
+func (l *SQLiteLedger) Merchants(ctx context.Context, tenant types.TenantID) ([]common.Address, error) {
+	const q = `
+		SELECT merchant, MAX(locked_at) AS last_seen
+		FROM obligations
+		WHERE tenant_id = ?
+		GROUP BY merchant
+		ORDER BY last_seen DESC
+	`
+
+	rows, err := l.db.QueryContext(ctx, q, string(tenant))
+	if err != nil {
+		return nil, fmt.Errorf("ledger: merchants for %s: %w", tenant, err)
+	}
+	defer rows.Close()
+
+	var out []common.Address
+	for rows.Next() {
+		var hexAddr string
+		var lastSeen int64
+		if err := rows.Scan(&hexAddr, &lastSeen); err != nil {
+			return nil, fmt.Errorf("ledger: merchants scan: %w", err)
+		}
+		out = append(out, common.HexToAddress(hexAddr))
+	}
+	return out, rows.Err()
 }
 
 // Snapshot returns Balances for the tenant:
@@ -268,17 +389,19 @@ func scanObligations(rows *sql.Rows) ([]types.Obligation, error) {
 			tenantID        string
 			merchantHex     string
 			amountStr       string
+			resourceID      string
 			resourceHash    []byte
 			lockedAt        int64
 			releaseDeadline int64
 			deliveredAt     *int64
 			status          string
+			lockTx          *string
 			settleTx        *string
 		)
 
 		if err := rows.Scan(
-			&escrowID, &tenantID, &merchantHex, &amountStr, &resourceHash,
-			&lockedAt, &releaseDeadline, &deliveredAt, &status, &settleTx,
+			&escrowID, &tenantID, &merchantHex, &amountStr, &resourceID, &resourceHash,
+			&lockedAt, &releaseDeadline, &deliveredAt, &status, &lockTx, &settleTx,
 		); err != nil {
 			return nil, fmt.Errorf("ledger: scanning row: %w", err)
 		}
@@ -293,6 +416,7 @@ func scanObligations(rows *sql.Rows) ([]types.Obligation, error) {
 			TenantID:        types.TenantID(tenantID),
 			Merchant:        common.HexToAddress(merchantHex),
 			Amount:          amount,
+			ResourceID:      resourceID,
 			LockedAt:        time.Unix(lockedAt, 0),
 			ReleaseDeadline: time.Unix(releaseDeadline, 0),
 			Status:          types.Status(status),
@@ -311,6 +435,10 @@ func scanObligations(rows *sql.Rows) ([]types.Obligation, error) {
 		if deliveredAt != nil {
 			t := time.Unix(*deliveredAt, 0)
 			ob.DeliveredAt = &t
+		}
+
+		if lockTx != nil {
+			ob.LockTx = types.TxHash(*lockTx)
 		}
 
 		if settleTx != nil {

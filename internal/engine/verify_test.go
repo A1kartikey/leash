@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"testing"
 
 	"github.com/A1kartikey/leash/internal/types"
@@ -9,7 +10,7 @@ import (
 
 func hashOf(s string) [32]byte { return crypto.Keccak256Hash([]byte(s)) }
 
-func TestJudge(t *testing.T) {
+func TestVerify(t *testing.T) {
 	const good = `{"temp":21}`
 	jsonHash := hashOf(good)
 
@@ -25,6 +26,12 @@ func TestJudge(t *testing.T) {
 		{"exact hash match", types.Challenge{ResourceHash: jsonHash}, 200, "application/json", good, types.VerdictDelivered, ReasonHashMatch},
 		{"hash match on 201", types.Challenge{ResourceHash: jsonHash}, 201, "application/json", good, types.VerdictDelivered, ReasonHashMatch},
 		{"non-2xx", types.Challenge{ResourceHash: jsonHash}, 500, "application/json", good, types.VerdictAbsent, ReasonBadStatus},
+		{"4xx", types.Challenge{ResourceHash: jsonHash}, 404, "application/json", good, types.VerdictAbsent, ReasonBadStatus},
+		{"402 on the paid retry", types.Challenge{ResourceHash: jsonHash}, 402, "application/json", good, types.VerdictAbsent, ReasonBadStatus},
+		// A timeout / context deadline means no response reached us at all. The
+		// caller passes status 0 and a nil body; that is an absent delivery,
+		// never an engine error that would stall settlement.
+		{"transport timeout", types.Challenge{ResourceHash: jsonHash}, 0, "", "", types.VerdictAbsent, ReasonBadStatus},
 		{"3xx is not 2xx", types.Challenge{ResourceHash: jsonHash}, 302, "application/json", good, types.VerdictAbsent, ReasonBadStatus},
 		{"empty body", types.Challenge{ResourceHash: jsonHash}, 200, "application/json", "", types.VerdictAbsent, ReasonEmptyBody},
 		{"empty body beats hash of empty", types.Challenge{ResourceHash: hashOf("")}, 200, "application/json", "", types.VerdictAbsent, ReasonEmptyBody},
@@ -74,7 +81,10 @@ func TestJudge(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Judge(tc.challenge, tc.status, tc.contentType, []byte(tc.body))
+			got, err := Verifier{}.Verify(context.Background(), tc.challenge, tc.status, tc.contentType, []byte(tc.body))
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
 			if got.Outcome != tc.want || got.Reason != tc.reason {
 				t.Fatalf("got %s/%s, want %s/%s", got.Outcome, got.Reason, tc.want, tc.reason)
 			}
@@ -82,12 +92,13 @@ func TestJudge(t *testing.T) {
 	}
 }
 
-// Judge must be a pure function: same inputs, same verdict, every time.
-func TestJudgeIsDeterministic(t *testing.T) {
+// Verify must be a pure function: same inputs, same verdict, every time.
+func TestVerifyIsDeterministic(t *testing.T) {
 	c := types.Challenge{ResourceHash: hashOf("body"), ContentType: "application/json", MinBytes: 2}
-	first := Judge(c, 200, "application/json", []byte("body"))
+	v := Verifier{}
+	first, _ := v.Verify(context.Background(), c, 200, "application/json", []byte("body"))
 	for i := 0; i < 100; i++ {
-		if got := Judge(c, 200, "application/json", []byte("body")); got != first {
+		if got, _ := v.Verify(context.Background(), c, 200, "application/json", []byte("body")); got != first {
 			t.Fatalf("iteration %d diverged: %+v vs %+v", i, got, first)
 		}
 	}

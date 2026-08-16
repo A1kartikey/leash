@@ -165,10 +165,12 @@ func (e *Engine) Fetch(ctx context.Context, tenant types.TenantID, req *http.Req
 		TenantID:        tenant,
 		Merchant:        ch.Merchant,
 		Amount:          ch.Price,
+		ResourceID:      ch.ResourceID,
 		ResourceHash:    ch.ResourceHash,
 		LockedAt:        now,
 		ReleaseDeadline: now.Add(e.cfg.TTL),
 		Status:          types.StatusLocked,
+		LockTx:          lockTx,
 	}
 	if err := e.ledger.Open(ctx, tenant, ob); err != nil {
 		// Funds are locked but unrecorded. Refuse to settle blind: the escrow
@@ -181,24 +183,29 @@ func (e *Engine) Fetch(ctx context.Context, tenant types.TenantID, req *http.Req
 
 	resp, err = e.send(ctx, req, reqBody, &id, lockTx)
 	if err != nil {
-		// No response at all is an absent delivery, not an engine failure.
+		// No response at all (timeout, context deadline) is an absent delivery,
+		// not an engine failure: status 0, nil body.
 		e.breaker.Failure(tenant, ch.Merchant)
-		res.Verdict = types.Verdict{Outcome: types.VerdictAbsent, Reason: ReasonBadStatus}
+		res.Verdict, _ = e.verifier.Verify(ctx, ch, 0, "", nil)
 		res.Status = http.StatusBadGateway
 		return res, fmt.Errorf("engine: paid request: %w", err)
 	}
 
-	verdict, err := e.verifier.Verify(ctx, ch, resp)
+	// Read the body once, here. Verify() is pure and never touches the wire,
+	// so the response stays readable: it is handed back with a fresh reader
+	// over the same bytes for anything downstream that forwards or logs it.
+	body, err := readBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+
+	verdict, err := e.verifier.Verify(ctx, ch, resp.StatusCode, resp.Header.Get("Content-Type"), body)
 	if err != nil {
 		return nil, fmt.Errorf("engine: verify escrow %d: %w", id, err)
 	}
 	res.Verdict = verdict
-
-	body, err := readResult(resp)
-	if err != nil {
-		return nil, err
-	}
-	res.Status, res.Header, res.Body = body.Status, body.Header, body.Body
+	res.Status, res.Header, res.Body = resp.StatusCode, resp.Header, body
 
 	if err := e.settle(ctx, chain, tenant, ch, res); err != nil {
 		return res, err
@@ -346,11 +353,24 @@ func (e *Engine) send(ctx context.Context, req *http.Request, body []byte, id *t
 	return e.http.Do(r)
 }
 
-func readResult(resp *http.Response) (*Result, error) {
+// MaxBodyBytes caps how much of a merchant response is read. A merchant is a
+// trust boundary: an unbounded body is an OOM they control.
+const MaxBodyBytes = 8 << 20 // 8 MiB
+
+// readBody reads and closes the response body, capped at MaxBodyBytes.
+func readBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, MaxBodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("engine: reading response body: %w", err)
+	}
+	return b, nil
+}
+
+func readResult(resp *http.Response) (*Result, error) {
+	b, err := readBody(resp)
+	if err != nil {
+		return nil, err
 	}
 	return &Result{Status: resp.StatusCode, Header: resp.Header, Body: b}, nil
 }

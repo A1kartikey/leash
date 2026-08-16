@@ -1,3 +1,9 @@
+# Environment & keys
+.env
+.env.*
+walletkey
+*.db
+
 # Foundry build artifacts
 contracts/out/
 contracts/cache/
@@ -16,3 +22,7 @@ contracts/cache/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# demo rig build artifacts
+.demo/

@@ -91,7 +91,7 @@ func signerLoop(ctx context.Context, client *ethclient.Client, key *ecdsa.Privat
 				Context: ctx,
 			}
 
-			tx, txErr := req.build(opts)
+			tx, txErr := buildWithGasBuffer(req.build, opts)
 
 			if txErr != nil && isNonceTooLow(txErr) {
 				// Re-sync nonce and retry once.
@@ -99,7 +99,7 @@ func signerLoop(ctx context.Context, client *ethclient.Client, key *ecdsa.Privat
 				if syncErr == nil {
 					nonce = synced
 					opts.Nonce = new(big.Int).SetUint64(nonce)
-					tx, txErr = req.build(opts)
+					tx, txErr = buildWithGasBuffer(req.build, opts)
 				} else {
 					txErr = fmt.Errorf("nonce re-sync failed: %w (original: %w)", syncErr, txErr)
 				}
@@ -112,6 +112,43 @@ func signerLoop(ctx context.Context, client *ethclient.Client, key *ecdsa.Privat
 			req.reply <- txResult{tx: tx, err: txErr}
 		}
 	}
+}
+
+// gasBufferPercent is the headroom added to the estimated gas limit.
+//
+// go-ethereum's bind uses eth_estimateGas verbatim, and measured against this
+// contract the estimate sat 0.8% above the minimum the call needs. That margin
+// does not survive concurrency: with 20 locks in flight, 6 of 20 reverted at
+// the bare estimate and 1 of 20 still reverted at +10%. Monad prices cold
+// storage access at 8,100 gas against Ethereum's 2,100, so a slot the
+// estimator saw warm costs 6,000 more when the transaction actually runs —
+// a handful of those is exactly the overrun observed.
+//
+// 25% is measured, not guessed: it is the first buffer at which 20 concurrent
+// locks all landed. Monad charges gas_limit * price rather than gas used, so
+// headroom is money the buyer pays on every transaction — but a reverted
+// transaction is charged its full limit too, and loses the lock as well, so
+// erring generous is strictly cheaper than erring tight.
+const gasBufferPercent = 25
+
+// buildWithGasBuffer builds the transaction twice: once without sending, to
+// learn the gas bind would have used, then again with that estimate plus
+// headroom. The first pass is where the estimate happens, so this costs no
+// extra RPC round trip beyond the one bind already made.
+func buildWithGasBuffer(build func(*bind.TransactOpts) (*types.Transaction, error), opts *bind.TransactOpts) (*types.Transaction, error) {
+	// Clear any limit left by a previous attempt, or the probe would just
+	// re-use it instead of estimating.
+	opts.GasLimit = 0
+	opts.NoSend = true
+	probe, err := build(opts)
+	opts.NoSend = false
+	if err != nil {
+		// Sending would fail identically; report the error the caller expects.
+		return nil, err
+	}
+
+	opts.GasLimit = probe.Gas() * (100 + gasBufferPercent) / 100
+	return build(opts)
 }
 
 // submitTx sends a transaction request through the signer loop and waits for

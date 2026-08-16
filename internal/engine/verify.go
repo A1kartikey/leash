@@ -1,11 +1,8 @@
 package engine
 
 import (
-	"bytes"
 	"context"
-	"io"
 	"mime"
-	"net/http"
 	"strings"
 
 	"github.com/A1kartikey/leash/internal/types"
@@ -81,24 +78,13 @@ func satisfiesContract(c types.Challenge, contentType string, body []byte) bool 
 	return true
 }
 
-// Verifier adapts Judge to types.Verifier. It reads the response body and
-// restores it so the caller can still consume it.
+// Verifier adapts Judge to types.Verifier. Like Judge it is pure: the caller
+// reads and closes the response body and hands the bytes over, so the response
+// is still readable downstream (logging, forwarding to the agent).
 type Verifier struct{}
 
 var _ types.Verifier = Verifier{}
 
-func (Verifier) Verify(_ context.Context, c types.Challenge, resp *http.Response) (types.Verdict, error) {
-	var body []byte
-	if resp.Body != nil {
-		var err error
-		body, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		if err != nil {
-			// A truncated read is an absent delivery, not an engine error:
-			// the settlement path must never stall on a merchant's bad write.
-			return types.Verdict{Outcome: types.VerdictAbsent, Reason: ReasonEmptyBody}, nil
-		}
-	}
-	return Judge(c, resp.StatusCode, resp.Header.Get("Content-Type"), body), nil
+func (Verifier) Verify(_ context.Context, c types.Challenge, status int, contentType string, body []byte) (types.Verdict, error) {
+	return Judge(c, status, contentType, body), nil
 }

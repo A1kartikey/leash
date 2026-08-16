@@ -5,9 +5,19 @@
 // with the retry count. That is the protocol's own documented failure
 // behaviour, and it is what the escrow + sweeper exist to bound.
 //
+// Two shapes:
+//
+//	-proxy http://localhost:8080   buy through the Leash sidecar, so the
+//	                               dashboard's ledger is the one being written
+//	(default)                      run its own engine + ledger, standalone
+//
+// Pace and pause are stage controls: requests fire every -pace, and the loop
+// can be held between demo beats without killing the process.
+//
 //	go run ./cmd/mockmerchant &
-//	go run ./cmd/agent -mock -n 5
-//	curl -X POST 'localhost:8081/mode?m=fail-after-settlement'   # watch the loss
+//	go run ./cmd/agent -mock -n 0 -pace 1500ms -control :8082
+//	curl -X POST localhost:8082/toggle     # pause / resume
+//	curl -X POST localhost:8081/mode -d fail
 package main
 
 import (
@@ -15,12 +25,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -34,16 +46,30 @@ import (
 
 func main() {
 	url := flag.String("url", "http://localhost:8081/resource", "paid resource to fetch")
+	proxy := flag.String("proxy", "", "buy through this Leash proxy instead of running an engine (e.g. http://localhost:8080)")
 	tenant := flag.String("tenant", "agent-1", "tenant id — scopes every ledger row and breaker counter")
 	dbPath := flag.String("db", filepath.Join(os.TempDir(), "leash-agent.db"), "obligation ledger path")
-	n := flag.Int("n", 5, "number of resources to buy")
+	n := flag.Int("n", 5, "number of resources to buy; 0 buys until stopped")
 	retries := flag.Int("retries", 2, "retries per resource after a non-delivery")
+	pace := flag.Duration("pace", 1500*time.Millisecond, "delay between requests — fast enough to watch, slow enough to read")
+	control := flag.String("control", "", "listen address for pause/resume control (e.g. :8082)")
 	ttl := flag.Duration("ttl", 30*time.Second, "escrow TTL (must match LEASH_DEFAULT_TTL on the real chain)")
 	useMock := flag.Bool("mock", false, "use an in-memory chain instead of Monad testnet")
 	flag.Parse()
 
+	log.SetFlags(log.Ltime)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	loop := &loop{pace: *pace}
+	if *control != "" {
+		go loop.serve(ctx, *control)
+	}
+
+	if *proxy != "" {
+		buyThroughProxy(ctx, loop, strings.TrimRight(*proxy, "/")+pathOf(*url), *n, *retries)
+		return
+	}
 
 	led, err := ledger.New(*dbPath)
 	if err != nil {
@@ -66,29 +92,27 @@ func main() {
 	go eng.RunSweeper(ctx, func() []types.TenantID { return []types.TenantID{tid} })
 
 	paidOut := new(big.Int) // wei that actually reached the merchant
-	attempts, delivered := 0, 0
 
-	for i := 0; i < *n && ctx.Err() == nil; i++ {
-		for try := 0; try <= *retries; try++ {
-			attempts++
-			res, err := buy(ctx, eng, tid, *url)
-			switch {
-			case errors.Is(err, engine.ErrCircuitOpen):
-				log.Printf("resource %d: circuit open — 503, no funds locked", i)
-				try = *retries // stop retrying a merchant we have cut off
-			case err != nil:
-				log.Printf("resource %d attempt %d: %v", i, try, err)
-			default:
-				log.Printf("resource %d attempt %d: %s (%s) escrow=%d settle=%s",
-					i, try, res.Verdict.Outcome, res.Verdict.Reason, res.EscrowID, res.SettleTx)
-				paidOut.Add(paidOut, merchantShare(cfg, res))
-				if res.Verdict.Outcome == types.VerdictDelivered {
-					delivered++
-					try = *retries // got what we paid for
-				}
+	loop.run(ctx, *n, *retries, func(i, try int) bool {
+		res, err := buy(ctx, eng, tid, *url)
+		switch {
+		case errors.Is(err, engine.ErrCircuitOpen):
+			log.Printf("resource %d try %d: CIRCUIT OPEN — 503, no funds locked", i, try)
+			return true // stop retrying a merchant we have cut off
+		case err != nil:
+			log.Printf("resource %d try %d: %v", i, try, err)
+			return false
+		default:
+			log.Printf("resource %d try %d: %-9s %-16s escrow=%d settle=%s",
+				i, try, res.Verdict.Outcome, res.Verdict.Reason, res.EscrowID, short(string(res.SettleTx)))
+			paidOut.Add(paidOut, merchantShare(cfg, res))
+			if res.Verdict.Outcome == types.VerdictDelivered {
+				loop.delivered++
+				return true
 			}
+			return false
 		}
-	}
+	})
 
 	// Give the sweeper a window to refund what never arrived.
 	log.Printf("waiting out the %s TTL so the sweeper can refund...", *ttl)
@@ -102,8 +126,102 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("\n--- tenant %s ---\nattempts   %d\ndelivered  %d\npaid out   %s wei\nrecovered  %s wei\nstill locked %s wei (%d obligations)\n",
-		tid, attempts, delivered, paidOut, snap.Recovered, snap.Locked, snap.PendingCount)
+		tid, loop.attempts, loop.delivered, paidOut, snap.Recovered, snap.Locked, snap.PendingCount)
 }
+
+// ---------------------------------------------------------------------------
+// The loop: paced, pausable, and the same shape in both modes
+// ---------------------------------------------------------------------------
+
+type loop struct {
+	pace      time.Duration
+	paused    atomic.Bool
+	attempts  int
+	delivered int
+}
+
+// run drives resources × retries, one attempt per pace tick, holding while
+// paused. attempt reports whether this resource is done (delivered, or not
+// worth retrying).
+func (l *loop) run(ctx context.Context, n, retries int, attempt func(i, try int) bool) {
+	for i := 0; (n == 0 || i < n) && ctx.Err() == nil; i++ {
+		for try := 0; try <= retries; try++ {
+			if !l.wait(ctx) {
+				return
+			}
+			l.attempts++
+			if attempt(i, try) {
+				break
+			}
+		}
+	}
+}
+
+// wait blocks while paused and then paces the next request. It returns false
+// once the context is done.
+func (l *loop) wait(ctx context.Context) bool {
+	announced := false
+	for l.paused.Load() {
+		if !announced {
+			log.Print("PAUSED — curl -X POST <control>/resume to continue")
+			announced = true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if announced {
+		log.Print("RESUMED")
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(l.pace):
+		return true
+	}
+}
+
+// serve exposes the stage controls. Pausing between beats beats killing the
+// process: the ledger, the sweeper and the escrows all stay live.
+func (l *loop) serve(ctx context.Context, addr string) {
+	mux := http.NewServeMux()
+	set := func(v bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			l.paused.Store(v)
+			fmt.Fprintln(w, l.status())
+		}
+	}
+	mux.HandleFunc("POST /pause", set(true))
+	mux.HandleFunc("POST /resume", set(false))
+	mux.HandleFunc("POST /toggle", func(w http.ResponseWriter, r *http.Request) {
+		l.paused.Store(!l.paused.Load())
+		log.Printf("control: %s", l.status())
+		fmt.Fprintln(w, l.status())
+	})
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s attempts=%d delivered=%d\n", l.status(), l.attempts, l.delivered)
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() { <-ctx.Done(); srv.Close() }()
+	log.Printf("control on %s: POST /pause /resume /toggle, GET /status", addr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("control: %v", err)
+	}
+}
+
+func (l *loop) status() string {
+	if l.paused.Load() {
+		return "paused"
+	}
+	return "running"
+}
+
+// ---------------------------------------------------------------------------
+// Buying
+// ---------------------------------------------------------------------------
 
 func buy(ctx context.Context, eng *engine.Engine, tid types.TenantID, url string) (*engine.Result, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -111,6 +229,46 @@ func buy(ctx context.Context, eng *engine.Engine, tid types.TenantID, url string
 		return nil, err
 	}
 	return eng.Fetch(ctx, tid, req)
+}
+
+// buyThroughProxy is the demo rig's shape: the sidecar owns the keys, the
+// ledger and the verdict, and the agent is just a client that keeps asking.
+// The verdict comes back on the response headers Leash sets.
+func buyThroughProxy(ctx context.Context, l *loop, url string, n, retries int) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	log.Printf("buying through the Leash proxy: %s", url)
+
+	l.run(ctx, n, retries, func(i, try int) bool {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			log.Printf("resource %d try %d: %v", i, try, err)
+			return true
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("resource %d try %d: %v", i, try, err)
+			return false
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			log.Printf("resource %d try %d: CIRCUIT OPEN — 503, no funds locked", i, try)
+			return true
+		}
+		verdict := resp.Header.Get("X-Leash-Verdict")
+		if verdict == "" {
+			log.Printf("resource %d try %d: %d, %d bytes (unpaid)", i, try, resp.StatusCode, len(body))
+			return true
+		}
+		log.Printf("resource %d try %d: %-9s %-16s %d, %d bytes",
+			i, try, verdict, resp.Header.Get("X-Leash-Reason"), resp.StatusCode, len(body))
+		if verdict == string(types.VerdictDelivered) {
+			l.delivered++
+			return true
+		}
+		return false
+	})
 }
 
 // merchantShare is what this result actually moved to the merchant. Absent
@@ -128,6 +286,28 @@ func merchantShare(cfg engine.Config, res *engine.Result) *big.Int {
 	default:
 		return new(big.Int)
 	}
+}
+
+// pathOf keeps the resource path when the request is redirected through a
+// proxy: -url .../resource plus -proxy :8080 becomes :8080/resource.
+func pathOf(rawURL string) string {
+	if i := strings.Index(rawURL, "://"); i >= 0 {
+		if j := strings.Index(rawURL[i+3:], "/"); j >= 0 {
+			return rawURL[i+3+j:]
+		}
+		return "/"
+	}
+	if strings.HasPrefix(rawURL, "/") {
+		return rawURL
+	}
+	return "/" + rawURL
+}
+
+func short(tx string) string {
+	if len(tx) <= 12 {
+		return tx
+	}
+	return tx[:8] + "…" + tx[len(tx)-4:]
 }
 
 // openChain returns the real Monad testnet wrapper, or an in-memory stand-in

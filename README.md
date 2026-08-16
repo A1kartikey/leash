@@ -1,5 +1,9 @@
 # Leash: L3 Autonomous Escrow & Recovery Protocol for AI Agents
 
+> 🌐 **Live Demo Dashboard:** [https://leash-5pi3.onrender.com/](https://leash-5pi3.onrender.com/)  
+> ⛓️ **Deployed Contract (Monad Testnet):** [`0x678d1Ef8835A51BCF215a9922c5775eF7D97C8A5`](https://testnet.monadexplorer.com/address/0x678d1Ef8835A51BCF215a9922c5775eF7D97C8A5)  
+> 📑 **Detailed Architecture & Flow Diagrams:** [ARCHITECTURE.md](ARCHITECTURE.md)
+
 Leash is an autonomous L3 escrow sidecar proxy and smart contract protocol built for AI agent payments on **Monad Testnet**. It eliminates counterparty risk in agent-to-merchant API payments: when an agent pays a merchant for data/services via HTTP 402, funds are locked in an on-chain escrow contract. If the merchant fails to deliver or returns invalid/corrupted data, Leash's deterministic verifier detects the non-delivery and the automated sweeper refunds 100% of the funds back to the agent without human intervention.
 
 ---

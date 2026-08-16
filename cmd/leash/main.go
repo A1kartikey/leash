@@ -99,20 +99,35 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("HEAD /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("HEAD /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.Handle("GET /events", http.HandlerFunc(d.events))
 	mux.Handle("GET /api/state", http.HandlerFunc(d.state))
-	// The dashboard is one static file. Everything else on GET is upstream
-	// traffic and goes through the settlement path.
+
 	ui := http.FileServer(http.Dir(*webDir))
-	mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handleUI := func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || strings.HasSuffix(r.URL.Path, ".html") ||
 			strings.HasSuffix(r.URL.Path, ".css") || strings.HasSuffix(r.URL.Path, ".js") {
 			ui.ServeHTTP(w, r)
 			return
 		}
 		d.proxy(w, r, *upstream)
-	}))
-	// Anything with a method other than GET is upstream traffic by definition.
+	}
+
+	mux.HandleFunc("GET /", handleUI)
+	mux.HandleFunc("HEAD /", handleUI)
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		d.proxy(w, r, *upstream)
 	}))
